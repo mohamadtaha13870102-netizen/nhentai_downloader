@@ -35,7 +35,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install curl_cffi httpx beautifulsoup4 img2pdf
+          pip install curl_cffi beautifulsoup4 img2pdf
 
       - name: Prepare constants.txt
         run: |
@@ -49,159 +49,156 @@ jobs:
           echo "📄 constants.txt content:"
           cat constants.txt
 
-      - name: Create download script
+      - name: Write download script
         run: |
-          cat > download_manga.py << 'PYTHON_SCRIPT'
-import re
-import os
-import asyncio
-import sys
-from curl_cffi import requests as curl_requests
-from bs4 import BeautifulSoup
-import img2pdf
-
-def extract_manga_id(url):
-    match = re.search(r'/g/(\d+)/?', url)
-    if match:
-        return match.group(1)
-    parts = url.rstrip('/').split('/')
-    for part in reversed(parts):
-        if part.isdigit():
-            return part
-    raise ValueError(f"Invalid URL: {url}")
-
-def safe_filename(name):
-    if not name:
-        return ''
-    return re.sub(r'[<>:"/\\|?*]', '', name).strip()[:255]
-
-def fetch_manga_info(manga_id):
-    url = f"https://nhentai.net/g/{manga_id}/"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://nhentai.net/',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    }
-    response = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
-    if response.status_code != 200:
-        raise Exception(f"HTTP {response.status_code} - blocked by Cloudflare")
-    soup = BeautifulSoup(response.text, 'html.parser')
-    title_elem = soup.find('h1', class_='title')
-    title = title_elem.text.strip() if title_elem else f"manga_{manga_id}"
-    # find page count
-    pages = 0
-    for span in soup.find_all('span'):
-        if 'pages' in span.text.lower():
-            try:
-                pages = int(re.search(r'\d+', span.text).group())
-            except:
-                pass
-    if pages == 0:
-        thumbs = soup.select('.thumb-container img')
-        pages = len(thumbs)
-    gallery_id = None
-    img_sample = soup.select_one('.thumb-container img')
-    if img_sample and img_sample.get('data-src'):
-        gallery_match = re.search(r'/galleries/(\d+)/', img_sample['data-src'])
-        if gallery_match:
-            gallery_id = gallery_match.group(1)
-    if not gallery_id:
-        gallery_id = manga_id
-    return {
-        'manga_id': manga_id,
-        'title': title,
-        'pages': pages,
-        'gallery_id': gallery_id
-    }
-
-async def download_manga_images(manga_info):
-    manga_id = manga_info['manga_id']
-    gallery_id = manga_info['gallery_id']
-    total_pages = manga_info['pages']
-    title = manga_info['title']
-    folder_name = f"{manga_id}_{safe_filename(title)}"
-    os.makedirs(folder_name, exist_ok=True)
-    servers = ['i1', 'i2', 'i3', 'i4']
-    exts = ['jpg', 'webp', 'png']
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://nhentai.net/'
-    }
-    downloaded = []
-    failed = []
-    for page in range(1, total_pages + 1):
-        found = False
-        for server in servers:
-            for ext in exts:
-                img_url = f"https://{server}.nhentai.net/galleries/{gallery_id}/{page}.{ext}"
-                try:
-                    resp = curl_requests.get(img_url, headers=headers, impersonate="chrome120", timeout=15)
-                    if resp.status_code == 200 and resp.content[:4] in (b'\xff\xd8\xff', b'\x89PNG', b'RIFF'):
-                        filename = os.path.join(folder_name, f"{page:03d}.{ext}")
-                        with open(filename, 'wb') as f:
-                            f.write(resp.content)
-                        downloaded.append(filename)
-                        print(f"✅ Page {page} downloaded")
-                        found = True
-                        break
-                except Exception:
-                    continue
-            if found:
-                break
-        if not found:
-            failed.append(page)
-            print(f"❌ Page {page} not found")
-    return folder_name, downloaded, failed
-
-def convert_to_pdf(folder_path):
-    images = []
-    for f in sorted(os.listdir(folder_path)):
-        if f.lower().endswith(('.jpg','.jpeg','.png','.webp')):
-            images.append(os.path.join(folder_path, f))
-    if not images:
-        return None
-    pdf_path = os.path.join(folder_path, f"{os.path.basename(folder_path)}.pdf")
-    with open(pdf_path, 'wb') as f:
-        f.write(img2pdf.convert(images))
-    return pdf_path
-
-def main():
-    constants = 'constants.txt'
-    if not os.path.exists(constants):
-        print("constants.txt not found")
-        sys.exit(1)
-    with open(constants) as f:
-        urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-    for url in urls:
-        print(f"\n📥 Processing: {url}")
-        try:
-            manga_id = extract_manga_id(url)
-            print(f"🆔 Manga ID: {manga_id}")
-            info = fetch_manga_info(manga_id)
-            print(f"📖 Title: {info['title']}, Pages: {info['pages']}")
-            folder, downloaded, failed = asyncio.run(download_manga_images(info))
-            if downloaded:
-                print(f"✅ Downloaded {len(downloaded)} images to {folder}")
-                pdf = convert_to_pdf(folder)
-                if pdf:
-                    print(f"📄 PDF created: {pdf}")
-            else:
-                print("❌ No images downloaded")
-            if failed:
-                with open('store.txt', 'a') as err_f:
-                    err_f.write(f"{url}:{','.join(map(str,failed))}\n")
-        except Exception as e:
-            print(f"🔥 Error: {e}")
-            with open('store.txt', 'a') as err_f:
-                err_f.write(f"{url}:error\n")
-
-if __name__ == '__main__':
-    main()
-PYTHON_SCRIPT
+          echo 'import re' > download_manga.py
+          echo 'import os' >> download_manga.py
+          echo 'import asyncio' >> download_manga.py
+          echo 'import sys' >> download_manga.py
+          echo 'from curl_cffi import requests as curl_requests' >> download_manga.py
+          echo 'from bs4 import BeautifulSoup' >> download_manga.py
+          echo 'import img2pdf' >> download_manga.py
+          echo '' >> download_manga.py
+          echo 'def extract_manga_id(url):' >> download_manga.py
+          echo '    match = re.search(r"/g/(\\d+)/?", url)' >> download_manga.py
+          echo '    if match:' >> download_manga.py
+          echo '        return match.group(1)' >> download_manga.py
+          echo '    parts = url.rstrip("/").split("/")' >> download_manga.py
+          echo '    for part in reversed(parts):' >> download_manga.py
+          echo '        if part.isdigit():' >> download_manga.py
+          echo '            return part' >> download_manga.py
+          echo '    raise ValueError(f"Invalid URL: {url}")' >> download_manga.py
+          echo '' >> download_manga.py
+          echo 'def safe_filename(name):' >> download_manga.py
+          echo '    if not name:' >> download_manga.py
+          echo '        return ""' >> download_manga.py
+          echo '    return re.sub(r"[<>:\"/\\\\|?*]", "", name).strip()[:255]' >> download_manga.py
+          echo '' >> download_manga.py
+          echo 'def fetch_manga_info(manga_id):' >> download_manga.py
+          echo '    url = f"https://nhentai.net/g/{manga_id}/"' >> download_manga.py
+          echo '    headers = {' >> download_manga.py
+          echo '        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",' >> download_manga.py
+          echo '        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",' >> download_manga.py
+          echo '        "Accept-Language": "en-US,en;q=0.5",' >> download_manga.py
+          echo '        "Referer": "https://nhentai.net/",' >> download_manga.py
+          echo '        "DNT": "1",' >> download_manga.py
+          echo '        "Connection": "keep-alive",' >> download_manga.py
+          echo '        "Upgrade-Insecure-Requests": "1"' >> download_manga.py
+          echo '    }' >> download_manga.py
+          echo '    response = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)' >> download_manga.py
+          echo '    if response.status_code != 200:' >> download_manga.py
+          echo '        raise Exception(f"HTTP {response.status_code} - blocked by Cloudflare")' >> download_manga.py
+          echo '    soup = BeautifulSoup(response.text, "html.parser")' >> download_manga.py
+          echo '    title_elem = soup.find("h1", class_="title")' >> download_manga.py
+          echo '    title = title_elem.text.strip() if title_elem else f"manga_{manga_id}"' >> download_manga.py
+          echo '    pages = 0' >> download_manga.py
+          echo '    for span in soup.find_all("span"):' >> download_manga.py
+          echo '        if "pages" in span.text.lower():' >> download_manga.py
+          echo '            try:' >> download_manga.py
+          echo '                pages = int(re.search(r"\\d+", span.text).group())' >> download_manga.py
+          echo '            except:' >> download_manga.py
+          echo '                pass' >> download_manga.py
+          echo '    if pages == 0:' >> download_manga.py
+          echo '        thumbs = soup.select(".thumb-container img")' >> download_manga.py
+          echo '        pages = len(thumbs)' >> download_manga.py
+          echo '    gallery_id = None' >> download_manga.py
+          echo '    img_sample = soup.select_one(".thumb-container img")' >> download_manga.py
+          echo '    if img_sample and img_sample.get("data-src"):' >> download_manga.py
+          echo '        gallery_match = re.search(r"/galleries/(\\d+)/", img_sample["data-src"])' >> download_manga.py
+          echo '        if gallery_match:' >> download_manga.py
+          echo '            gallery_id = gallery_match.group(1)' >> download_manga.py
+          echo '    if not gallery_id:' >> download_manga.py
+          echo '        gallery_id = manga_id' >> download_manga.py
+          echo '    return {' >> download_manga.py
+          echo '        "manga_id": manga_id,' >> download_manga.py
+          echo '        "title": title,' >> download_manga.py
+          echo '        "pages": pages,' >> download_manga.py
+          echo '        "gallery_id": gallery_id' >> download_manga.py
+          echo '    }' >> download_manga.py
+          echo '' >> download_manga.py
+          echo 'async def download_manga_images(manga_info):' >> download_manga.py
+          echo '    manga_id = manga_info["manga_id"]' >> download_manga.py
+          echo '    gallery_id = manga_info["gallery_id"]' >> download_manga.py
+          echo '    total_pages = manga_info["pages"]' >> download_manga.py
+          echo '    title = manga_info["title"]' >> download_manga.py
+          echo '    folder_name = f"{manga_id}_{safe_filename(title)}"' >> download_manga.py
+          echo '    os.makedirs(folder_name, exist_ok=True)' >> download_manga.py
+          echo '    servers = ["i1", "i2", "i3", "i4"]' >> download_manga.py
+          echo '    exts = ["jpg", "webp", "png"]' >> download_manga.py
+          echo '    headers = {' >> download_manga.py
+          echo '        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",' >> download_manga.py
+          echo '        "Referer": "https://nhentai.net/"' >> download_manga.py
+          echo '    }' >> download_manga.py
+          echo '    downloaded = []' >> download_manga.py
+          echo '    failed = []' >> download_manga.py
+          echo '    for page in range(1, total_pages + 1):' >> download_manga.py
+          echo '        found = False' >> download_manga.py
+          echo '        for server in servers:' >> download_manga.py
+          echo '            for ext in exts:' >> download_manga.py
+          echo '                img_url = f"https://{server}.nhentai.net/galleries/{gallery_id}/{page}.{ext}"' >> download_manga.py
+          echo '                try:' >> download_manga.py
+          echo '                    resp = curl_requests.get(img_url, headers=headers, impersonate="chrome120", timeout=15)' >> download_manga.py
+          echo '                    if resp.status_code == 200 and resp.content[:4] in (b"\\xff\\xd8\\xff", b"\\x89PNG", b"RIFF"):' >> download_manga.py
+          echo '                        filename = os.path.join(folder_name, f"{page:03d}.{ext}")' >> download_manga.py
+          echo '                        with open(filename, "wb") as f:' >> download_manga.py
+          echo '                            f.write(resp.content)' >> download_manga.py
+          echo '                        downloaded.append(filename)' >> download_manga.py
+          echo '                        print(f"✅ Page {page} downloaded")' >> download_manga.py
+          echo '                        found = True' >> download_manga.py
+          echo '                        break' >> download_manga.py
+          echo '                except Exception:' >> download_manga.py
+          echo '                    continue' >> download_manga.py
+          echo '            if found:' >> download_manga.py
+          echo '                break' >> download_manga.py
+          echo '        if not found:' >> download_manga.py
+          echo '            failed.append(page)' >> download_manga.py
+          echo '            print(f"❌ Page {page} not found")' >> download_manga.py
+          echo '    return folder_name, downloaded, failed' >> download_manga.py
+          echo '' >> download_manga.py
+          echo 'def convert_to_pdf(folder_path):' >> download_manga.py
+          echo '    images = []' >> download_manga.py
+          echo '    for f in sorted(os.listdir(folder_path)):' >> download_manga.py
+          echo '        if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):' >> download_manga.py
+          echo '            images.append(os.path.join(folder_path, f))' >> download_manga.py
+          echo '    if not images:' >> download_manga.py
+          echo '        return None' >> download_manga.py
+          echo '    pdf_path = os.path.join(folder_path, f"{os.path.basename(folder_path)}.pdf")' >> download_manga.py
+          echo '    with open(pdf_path, "wb") as f:' >> download_manga.py
+          echo '        f.write(img2pdf.convert(images))' >> download_manga.py
+          echo '    return pdf_path' >> download_manga.py
+          echo '' >> download_manga.py
+          echo 'def main():' >> download_manga.py
+          echo '    constants = "constants.txt"' >> download_manga.py
+          echo '    if not os.path.exists(constants):' >> download_manga.py
+          echo '        print("constants.txt not found")' >> download_manga.py
+          echo '        sys.exit(1)' >> download_manga.py
+          echo '    with open(constants) as f:' >> download_manga.py
+          echo '        urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]' >> download_manga.py
+          echo '    for url in urls:' >> download_manga.py
+          echo '        print(f"\\n📥 Processing: {url}")' >> download_manga.py
+          echo '        try:' >> download_manga.py
+          echo '            manga_id = extract_manga_id(url)' >> download_manga.py
+          echo '            print(f"🆔 Manga ID: {manga_id}")' >> download_manga.py
+          echo '            info = fetch_manga_info(manga_id)' >> download_manga.py
+          echo '            print(f"📖 Title: {info["title"]}, Pages: {info["pages"]}")' >> download_manga.py
+          echo '            folder, downloaded, failed = asyncio.run(download_manga_images(info))' >> download_manga.py
+          echo '            if downloaded:' >> download_manga.py
+          echo '                print(f"✅ Downloaded {len(downloaded)} images to {folder}")' >> download_manga.py
+          echo '                pdf = convert_to_pdf(folder)' >> download_manga.py
+          echo '                if pdf:' >> download_manga.py
+          echo '                    print(f"📄 PDF created: {pdf}")' >> download_manga.py
+          echo '            else:' >> download_manga.py
+          echo '                print("❌ No images downloaded")' >> download_manga.py
+          echo '            if failed:' >> download_manga.py
+          echo '                with open("store.txt", "a") as err_f:' >> download_manga.py
+          echo '                    err_f.write(f"{url}:{','.join(map(str,failed))}\\n")' >> download_manga.py
+          echo '        except Exception as e:' >> download_manga.py
+          echo '            print(f"🔥 Error: {e}")' >> download_manga.py
+          echo '            with open("store.txt", "a") as err_f:' >> download_manga.py
+          echo '                err_f.write(f"{url}:error\\n")' >> download_manga.py
+          echo '' >> download_manga.py
+          echo 'if __name__ == "__main__":' >> download_manga.py
+          echo '    main()' >> download_manga.py
 
       - name: Run downloader script
         run: python download_manga.py
