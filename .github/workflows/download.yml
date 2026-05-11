@@ -1,4 +1,4 @@
-name: NHentai Downloader (Debug + Save to Repo)
+name: NHentai Downloader (Cloudflare Bypass)
 
 on:
   workflow_dispatch:
@@ -29,17 +29,13 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install system dependencies (for img2pdf)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y img2pdf  # اگر نیاز به کتابخانه خارجی دارد
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # نصب دستی چند کتابخانه ضروری (در صورت نبود در requirements.txt)
-          pip install requests beautifulsoup4 lxml pillow img2pdf nhentai
+          pip install curl_cffi httpx beautifulsoup4 img2pdf
 
       - name: Prepare constants.txt
         run: |
@@ -52,59 +48,190 @@ jobs:
           fi
           echo "📄 constants.txt content:"
           cat constants.txt
-          echo "------------------------"
 
-      - name: Run downloader script
+      - name: Run downloader (enhanced script)
         run: |
-          # اجرای اسکریپت و گرفتن خروجی کامل
-          python save_pdf.py 2>&1 | tee log.txt
-          # اگر save_pdf.py وجود نداشت، simple.py را اجرا کن
-          if [ $? -ne 0 ]; then
-            echo "⚠️ save_pdf.py failed, trying simple.py..."
-            python simple.py 2>&1 | tee -a log.txt
-          fi
+          python - <<'EOF'
+import re, os, asyncio, base64, json, sys
+from curl_cffi import requests as curl_requests
+from bs4 import BeautifulSoup
+import img2pdf
 
-      - name: List all files after download
-        run: |
-          echo "📁 Current directory contents (excluding .git):"
-          ls -la --ignore=.git
-          echo "📂 PDF files:"
-          find . -name "*.pdf" -type f
-          echo "📂 Directories (possible manga folders):"
-          find . -maxdepth 1 -type d -not -name "." -not -name ".git" -not -name "download" -not -name "__pycache__"
+# همان توابع کمکی از save_pdf.py (اما با curl_cffi)
+def extract_manga_id(url):
+    match = re.search(r'/g/(\d+)/?', url)
+    if match:
+        return match.group(1)
+    parts = url.rstrip('/').split('/')
+    for part in reversed(parts):
+        if part.isdigit():
+            return part
+    raise ValueError(f"Invalid URL: {url}")
 
-      - name: Check if any manga was downloaded
-        id: check
-        run: |
-          # اگر هیچ فایل PDF و هیچ پوشه‌ای (به جز موارد استثنا) وجود نداشته باشد، خطا بده
-          pdf_count=$(find . -maxdepth 1 -name "*.pdf" -type f | wc -l)
-          dir_count=$(find . -maxdepth 1 -type d -not -name "." -not -name ".git" -not -name "download" -not -name "__pycache__" | wc -l)
-          if [ $pdf_count -eq 0 ] && [ $dir_count -eq 0 ]; then
-            echo "❌ ERROR: No PDFs and no manga folders were created."
-            echo "Check the log above for errors (Cloudflare block? Wrong URL? Missing dependencies?)"
-            exit 1
-          else
-            echo "✅ Found $pdf_count PDF(s) and $dir_count folder(s)."
-            echo "success=true" >> $GITHUB_OUTPUT
-          fi
+def safe_filename(name):
+    if not name:
+        return ''
+    return re.sub(r'[<>:"/\\|?*]', '', name).strip()[:255]
 
-      - name: Create download folder and move files
-        if: steps.check.outputs.success == 'true'
+def fetch_manga_info(manga_id):
+    """دریافت اطلاعات مانگا با دور زدن Cloudflare"""
+    url = f"https://nhentai.net/g/{manga_id}/"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': 'https://nhentai.net/',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+    # استفاده از curl_cffi با ایمیتیشن مرورگر واقعی
+    response = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
+    if response.status_code != 200:
+        raise Exception(f"HTTP {response.status_code} - possibly blocked by Cloudflare")
+    soup = BeautifulSoup(response.text, 'html.parser')
+    # استخراج عنوان
+    title_elem = soup.find('h1', class_='title')
+    title = title_elem.text.strip() if title_elem else f"manga_{manga_id}"
+    # تعداد صفحات
+    page_count_elem = soup.find('span', class_='name')
+    if not page_count_elem:
+        page_count_elem = soup.find('div', id='thumbnail-container')
+    # معمولا تعداد صفحات در یک جای دیگر هست
+    pages = 0
+    for span in soup.find_all('span'):
+        if 'pages' in span.text.lower():
+            try:
+                pages = int(re.search(r'\d+', span.text).group())
+            except:
+                pass
+    if pages == 0:
+        # fallback: تعداد تصاویر در container
+        thumbs = soup.select('.thumb-container img')
+        pages = len(thumbs)
+    # استخراج gallery_id (از src تصاویر)
+    gallery_id = None
+    img_sample = soup.select_one('.thumb-container img')
+    if img_sample and img_sample.get('data-src'):
+        # نمونه: https://t.nhentai.net/galleries/123456/1.jpg
+        gallery_match = re.search(r'/galleries/(\d+)/', img_sample['data-src'])
+        if gallery_match:
+            gallery_id = gallery_match.group(1)
+    if not gallery_id:
+        # اگر پیدا نشد، خود manga_id رو استفاده می‌کنیم (بعضی مواقع کار می‌کنه)
+        gallery_id = manga_id
+    return {
+        'manga_id': manga_id,
+        'title': title,
+        'pages': pages,
+        'gallery_id': gallery_id
+    }
+
+async def download_manga_images(manga_info):
+    manga_id = manga_info['manga_id']
+    gallery_id = manga_info['gallery_id']
+    total_pages = manga_info['pages']
+    title = manga_info['title']
+    folder_name = f"{manga_id}_{safe_filename(title)}"
+    os.makedirs(folder_name, exist_ok=True)
+    
+    # سرورهای تصاویر
+    servers = ['i1', 'i2', 'i3', 'i4']
+    exts = ['jpg', 'webp', 'png']
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://nhentai.net/'
+    }
+    
+    downloaded = []
+    failed = []
+    
+    for page in range(1, total_pages + 1):
+        found = False
+        for server in servers:
+            for ext in exts:
+                img_url = f"https://{server}.nhentai.net/galleries/{gallery_id}/{page}.{ext}"
+                try:
+                    # استفاده از curl_cffi برای دانلود تصویر (با impersonate)
+                    resp = curl_requests.get(img_url, headers=headers, impersonate="chrome120", timeout=15)
+                    if resp.status_code == 200 and resp.content[:4] in (b'\xff\xd8\xff', b'\x89PNG', b'RIFF'):
+                        filename = os.path.join(folder_name, f"{page:03d}.{ext}")
+                        with open(filename, 'wb') as f:
+                            f.write(resp.content)
+                        downloaded.append(filename)
+                        print(f"✅ صفحه {page} دانلود شد")
+                        found = True
+                        break
+                except Exception as e:
+                    continue
+            if found:
+                break
+        if not found:
+            failed.append(page)
+            print(f"❌ صفحه {page} یافت نشد")
+    
+    return folder_name, downloaded, failed
+
+def convert_to_pdf(folder_path):
+    images = []
+    for f in sorted(os.listdir(folder_path)):
+        if f.lower().endswith(('.jpg','.jpeg','.png','.webp')):
+            images.append(os.path.join(folder_path, f))
+    if not images:
+        return None
+    pdf_path = os.path.join(folder_path, f"{os.path.basename(folder_path)}.pdf")
+    with open(pdf_path, 'wb') as f:
+        f.write(img2pdf.convert(images))
+    return pdf_path
+
+def main():
+    constants = 'constants.txt'
+    if not os.path.exists(constants):
+        print("constants.txt not found")
+        sys.exit(1)
+    with open(constants) as f:
+        urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    for url in urls:
+        print(f"\n📥 Processing: {url}")
+        try:
+            manga_id = extract_manga_id(url)
+            print(f"🆔 Manga ID: {manga_id}")
+            info = fetch_manga_info(manga_id)
+            print(f"📖 Title: {info['title']}, Pages: {info['pages']}")
+            folder, downloaded, failed = asyncio.run(download_manga_images(info))
+            if downloaded:
+                print(f"✅ Downloaded {len(downloaded)} images to {folder}")
+                pdf = convert_to_pdf(folder)
+                if pdf:
+                    print(f"📄 PDF created: {pdf}")
+            else:
+                print("❌ No images downloaded")
+            if failed:
+                with open('store.txt', 'a') as err_f:
+                    err_f.write(f"{url}:{','.join(map(str,failed))}\n")
+        except Exception as e:
+            print(f"🔥 Error: {e}")
+            with open('store.txt', 'a') as err_f:
+                err_f.write(f"{url}:error\n")
+
+if __name__ == '__main__':
+    main()
+EOF
+
+      - name: Move files to download folder
         run: |
           mkdir -p download
-          # انتقال پوشه‌های محتوا (به جز خود download و پوشه‌های سیستمی)
-          for dir in */; do
-            if [[ "$dir" != "download/" && "$dir" != "__pycache__/" && "$dir" != ".git/" ]]; then
-              if [ -d "$dir" ]; then
-                mv "$dir" download/ 2>/dev/null || true
-              fi
+          # انتقال پوشه‌های دانلود شده (شروع با عدد) به داخل download/
+          for dir in [0-9]*/ ; do
+            if [ -d "$dir" ]; then
+              mv "$dir" download/ 2>/dev/null || true
             fi
           done
+          # انتقال PDFهای احتمالی
           mv *.pdf download/ 2>/dev/null || true
           echo "✅ Files moved to download/"
 
       - name: Commit and push downloaded files
-        if: steps.check.outputs.success == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -113,5 +240,5 @@ jobs:
             echo "📭 No new files to commit."
             exit 0
           fi
-          git commit -m "Add downloaded manga files [skip ci]"
+          git commit -m "Add downloaded manga [skip ci]"
           git push
