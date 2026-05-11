@@ -1,4 +1,4 @@
-name: NHentai Downloader (Save to Repo)
+name: NHentai Downloader (Debug + Save to Repo)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
       - 'constants.txt'
 
 permissions:
-  contents: write  # برای اجازه push به ریپو
+  contents: write
 
 jobs:
   download:
@@ -22,17 +22,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # برای جلوگیری از مشکل در push
+          fetch-depth: 0
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install system dependencies (for img2pdf)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y img2pdf  # اگر نیاز به کتابخانه خارجی دارد
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # نصب دستی چند کتابخانه ضروری (در صورت نبود در requirements.txt)
+          pip install requests beautifulsoup4 lxml pillow img2pdf nhentai
 
       - name: Prepare constants.txt
         run: |
@@ -40,32 +47,64 @@ jobs:
             echo "${{ github.event.inputs.manga_url }}" > constants.txt
           fi
           if [ ! -s constants.txt ]; then
-            echo "❌ Error: constants.txt is empty."
+            echo "❌ ERROR: constants.txt is empty"
             exit 1
           fi
-          echo "📄 Content of constants.txt:"
+          echo "📄 constants.txt content:"
           cat constants.txt
+          echo "------------------------"
 
       - name: Run downloader script
         run: |
-          python save_pdf.py
-          # اگر می‌خواهید نسخه ساده را اجرا کنید، خط بالا را کامنت کرده و خط زیر را فعال کنید:
-          # python simple.py
+          # اجرای اسکریپت و گرفتن خروجی کامل
+          python save_pdf.py 2>&1 | tee log.txt
+          # اگر save_pdf.py وجود نداشت، simple.py را اجرا کن
+          if [ $? -ne 0 ]; then
+            echo "⚠️ save_pdf.py failed, trying simple.py..."
+            python simple.py 2>&1 | tee -a log.txt
+          fi
+
+      - name: List all files after download
+        run: |
+          echo "📁 Current directory contents (excluding .git):"
+          ls -la --ignore=.git
+          echo "📂 PDF files:"
+          find . -name "*.pdf" -type f
+          echo "📂 Directories (possible manga folders):"
+          find . -maxdepth 1 -type d -not -name "." -not -name ".git" -not -name "download" -not -name "__pycache__"
+
+      - name: Check if any manga was downloaded
+        id: check
+        run: |
+          # اگر هیچ فایل PDF و هیچ پوشه‌ای (به جز موارد استثنا) وجود نداشته باشد، خطا بده
+          pdf_count=$(find . -maxdepth 1 -name "*.pdf" -type f | wc -l)
+          dir_count=$(find . -maxdepth 1 -type d -not -name "." -not -name ".git" -not -name "download" -not -name "__pycache__" | wc -l)
+          if [ $pdf_count -eq 0 ] && [ $dir_count -eq 0 ]; then
+            echo "❌ ERROR: No PDFs and no manga folders were created."
+            echo "Check the log above for errors (Cloudflare block? Wrong URL? Missing dependencies?)"
+            exit 1
+          else
+            echo "✅ Found $pdf_count PDF(s) and $dir_count folder(s)."
+            echo "success=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Create download folder and move files
+        if: steps.check.outputs.success == 'true'
         run: |
           mkdir -p download
-          # همه پوشه‌هایی که دانلود شده‌اند (به جز .git, download, __pycache__ و غیره)
-          # و همه فایل‌های PDF موجود در ریشه را به download منتقل کنید
+          # انتقال پوشه‌های محتوا (به جز خود download و پوشه‌های سیستمی)
           for dir in */; do
             if [[ "$dir" != "download/" && "$dir" != "__pycache__/" && "$dir" != ".git/" ]]; then
-              mv "$dir" download/ 2>/dev/null || true
+              if [ -d "$dir" ]; then
+                mv "$dir" download/ 2>/dev/null || true
+              fi
             fi
           done
           mv *.pdf download/ 2>/dev/null || true
           echo "✅ Files moved to download/"
 
       - name: Commit and push downloaded files
+        if: steps.check.outputs.success == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
