@@ -49,15 +49,17 @@ jobs:
           echo "📄 constants.txt content:"
           cat constants.txt
 
-      - name: Run downloader (enhanced script)
+      - name: Create download script
         run: |
-          python - <<'EOF'
-import re, os, asyncio, base64, json, sys
+          cat > download_manga.py << 'PYTHON_SCRIPT'
+import re
+import os
+import asyncio
+import sys
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 import img2pdf
 
-# همان توابع کمکی از save_pdf.py (اما با curl_cffi)
 def extract_manga_id(url):
     match = re.search(r'/g/(\d+)/?', url)
     if match:
@@ -74,7 +76,6 @@ def safe_filename(name):
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()[:255]
 
 def fetch_manga_info(manga_id):
-    """دریافت اطلاعات مانگا با دور زدن Cloudflare"""
     url = f"https://nhentai.net/g/{manga_id}/"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -85,19 +86,13 @@ def fetch_manga_info(manga_id):
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
     }
-    # استفاده از curl_cffi با ایمیتیشن مرورگر واقعی
     response = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=30)
     if response.status_code != 200:
-        raise Exception(f"HTTP {response.status_code} - possibly blocked by Cloudflare")
+        raise Exception(f"HTTP {response.status_code} - blocked by Cloudflare")
     soup = BeautifulSoup(response.text, 'html.parser')
-    # استخراج عنوان
     title_elem = soup.find('h1', class_='title')
     title = title_elem.text.strip() if title_elem else f"manga_{manga_id}"
-    # تعداد صفحات
-    page_count_elem = soup.find('span', class_='name')
-    if not page_count_elem:
-        page_count_elem = soup.find('div', id='thumbnail-container')
-    # معمولا تعداد صفحات در یک جای دیگر هست
+    # find page count
     pages = 0
     for span in soup.find_all('span'):
         if 'pages' in span.text.lower():
@@ -106,19 +101,15 @@ def fetch_manga_info(manga_id):
             except:
                 pass
     if pages == 0:
-        # fallback: تعداد تصاویر در container
         thumbs = soup.select('.thumb-container img')
         pages = len(thumbs)
-    # استخراج gallery_id (از src تصاویر)
     gallery_id = None
     img_sample = soup.select_one('.thumb-container img')
     if img_sample and img_sample.get('data-src'):
-        # نمونه: https://t.nhentai.net/galleries/123456/1.jpg
         gallery_match = re.search(r'/galleries/(\d+)/', img_sample['data-src'])
         if gallery_match:
             gallery_id = gallery_match.group(1)
     if not gallery_id:
-        # اگر پیدا نشد، خود manga_id رو استفاده می‌کنیم (بعضی مواقع کار می‌کنه)
         gallery_id = manga_id
     return {
         'manga_id': manga_id,
@@ -134,42 +125,36 @@ async def download_manga_images(manga_info):
     title = manga_info['title']
     folder_name = f"{manga_id}_{safe_filename(title)}"
     os.makedirs(folder_name, exist_ok=True)
-    
-    # سرورهای تصاویر
     servers = ['i1', 'i2', 'i3', 'i4']
     exts = ['jpg', 'webp', 'png']
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://nhentai.net/'
     }
-    
     downloaded = []
     failed = []
-    
     for page in range(1, total_pages + 1):
         found = False
         for server in servers:
             for ext in exts:
                 img_url = f"https://{server}.nhentai.net/galleries/{gallery_id}/{page}.{ext}"
                 try:
-                    # استفاده از curl_cffi برای دانلود تصویر (با impersonate)
                     resp = curl_requests.get(img_url, headers=headers, impersonate="chrome120", timeout=15)
                     if resp.status_code == 200 and resp.content[:4] in (b'\xff\xd8\xff', b'\x89PNG', b'RIFF'):
                         filename = os.path.join(folder_name, f"{page:03d}.{ext}")
                         with open(filename, 'wb') as f:
                             f.write(resp.content)
                         downloaded.append(filename)
-                        print(f"✅ صفحه {page} دانلود شد")
+                        print(f"✅ Page {page} downloaded")
                         found = True
                         break
-                except Exception as e:
+                except Exception:
                     continue
             if found:
                 break
         if not found:
             failed.append(page)
-            print(f"❌ صفحه {page} یافت نشد")
-    
+            print(f"❌ Page {page} not found")
     return folder_name, downloaded, failed
 
 def convert_to_pdf(folder_path):
@@ -216,18 +201,19 @@ def main():
 
 if __name__ == '__main__':
     main()
-EOF
+PYTHON_SCRIPT
+
+      - name: Run downloader script
+        run: python download_manga.py
 
       - name: Move files to download folder
         run: |
           mkdir -p download
-          # انتقال پوشه‌های دانلود شده (شروع با عدد) به داخل download/
           for dir in [0-9]*/ ; do
             if [ -d "$dir" ]; then
               mv "$dir" download/ 2>/dev/null || true
             fi
           done
-          # انتقال PDFهای احتمالی
           mv *.pdf download/ 2>/dev/null || true
           echo "✅ Files moved to download/"
 
